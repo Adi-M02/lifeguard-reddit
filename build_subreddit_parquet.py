@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 import pyarrow.types as patypes  # <-- needed for schema guard
+import pyarrow.compute as pc
 
 import parse_zsts as pz  # read_lines_zst, process_json_object, infer_kind_and_month_from_name, list_zst_files
 
@@ -124,7 +125,44 @@ def _iter_batches_for_file(
         yield batch
 
 
-# --------------------- empty-struct sanitization ---------------------
+# --------------------- deep nested sanitization ---------------------
+
+def _sanitize_nested_for_parquet(value: Any) -> Any:
+    """
+    Recursively sanitize to keep Parquet-safe types:
+      - Convert empty dicts {} to None (so Arrow doesn't infer zero-child struct).
+      - For dicts: keep keys whose sanitized value is not None.
+      - For lists: sanitize each element; if all elements become None, return None.
+      - Primitive scalars pass through unchanged.
+    """
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            sv = _sanitize_nested_for_parquet(v)
+            if sv is not None:
+                out[k] = sv
+        return out if out else None
+    elif isinstance(value, list):
+        sanitized = [_sanitize_nested_for_parquet(v) for v in value]
+        # drop list entirely if every element is None (prevents list<null> types)
+        if any(elem is not None for elem in sanitized):
+            return sanitized
+        else:
+            return None
+    else:
+        return value
+
+
+def _sanitize_record_for_parquet(rec: Dict[str, Any]) -> Dict[str, Any]:
+    out = {}
+    for k, v in rec.items():
+        sv = _sanitize_nested_for_parquet(v)
+        if sv is not None:
+            out[k] = sv
+    return out
+
+
+# --------------------- empty-struct sanitization (top-level batch pass) ---------------------
 
 def _drop_empty_struct_columns_from_batch(
     batch: List[Dict[str, Any]],
@@ -190,9 +228,12 @@ def _write_shard_for_file(args: Tuple[str, str, int, str, str, int, Any]) -> Tup
         for raw_batch in _iter_batches_for_file(
             path, subreddit_lower, batch_size, stats, progress_q=progress_q, heartbeat_lines=heartbeat_lines
         ):
+            # 0) Deep sanitize nested empty dicts/lists across all records
+            deep_sanitized = [_sanitize_record_for_parquet(rec) for rec in raw_batch]
+
             # 1) Remove any top-level {} columns from this batch (+ previously dropped)
             batch_list, newly_dropped = _drop_empty_struct_columns_from_batch(
-                raw_batch, dropped_empty_struct_fields
+                deep_sanitized, dropped_empty_struct_fields
             )
             if newly_dropped and progress_q is not None:
                 progress_q.put({
@@ -207,7 +248,7 @@ def _write_shard_for_file(args: Tuple[str, str, int, str, str, int, Any]) -> Tup
             # 2) Build table
             tbl = pa.Table.from_pylist(batch_list)
 
-            # 3) Second guard: if Arrow still produced any struct<> (zero children), drop those columns
+            # 3) Second guard: if Arrow still produced any top-level struct<> (zero children), drop those columns
             empty_struct_cols: List[str] = []
             for field in tbl.schema:
                 if patypes.is_struct(field.type) and len(field.type) == 0:
@@ -302,6 +343,68 @@ def _write_shard_for_file(args: Tuple[str, str, int, str, str, int, Any]) -> Tup
     return str(shard_path), stats
 
 
+# --------------------- schema alignment helpers ---------------------
+
+def _read_schema_from_parquet(path: Path) -> pa.Schema:
+    """
+    Load a reference schema from an existing Parquet file or directory.
+    """
+    try:
+        return pq.read_schema(str(path))
+    except Exception:
+        dset = ds.dataset(str(path), format="parquet")
+        return dset.schema
+
+
+def _ensure_string_compat(src_type: pa.DataType, dst_type: pa.DataType) -> Optional[pa.DataType]:
+    """
+    Handle string vs large_string minor differences; return a cast target type if compatible.
+    """
+    if (patypes.is_string(src_type) and patypes.is_large_string(dst_type)) or \
+       (patypes.is_large_string(src_type) and patypes.is_string(dst_type)):
+        return dst_type
+    return None
+
+
+def _align_table_to_schema(tbl: pa.Table, target_schema: pa.Schema) -> pa.Table:
+    """
+    Project/cast a table to exactly match target_schema:
+      - Add missing columns as all-null with the correct type (including nested).
+      - Cast columns to the target type when possible (including string<->large_string).
+      - Drop extra columns not present in target_schema.
+      - Preserve column order exactly as in target_schema.
+    """
+    cols = []
+    names = set(tbl.column_names)
+
+    for field in target_schema:
+        name = field.name
+        if name in names:
+            col = tbl[name]
+            if not col.type.equals(field.type):
+                # Try a direct cast
+                try:
+                    col_cast = pc.cast(col, field.type, safe=False)
+                    col = col_cast
+                except Exception:
+                    # Try string/large_string compatibility
+                    compat = _ensure_string_compat(col.type, field.type)
+                    if compat is not None:
+                        try:
+                            col = pc.cast(col, compat, safe=False)
+                        except Exception:
+                            col = pa.nulls(tbl.num_rows, type=field.type)
+                    else:
+                        # Fallback to nulls if cast fails (keeps structure identical)
+                        col = pa.nulls(tbl.num_rows, type=field.type)
+        else:
+            col = pa.nulls(tbl.num_rows, type=field.type)
+        cols.append(col)
+
+    aligned = pa.Table.from_arrays(cols, schema=target_schema)
+    return aligned
+
+
 # --------------------- coalesce shards → single parquet ---------------------
 
 def _coalesce_shards_to_single(
@@ -309,21 +412,25 @@ def _coalesce_shards_to_single(
     out_parquet: Path,
     compression: str = "zstd",
     coalesce_batch_rows: int = 64_000,
+    reference_schema: Optional[pa.Schema] = None,
 ) -> int:
     """
     Read all shard parquet files and write a single unified parquet.
-    Uses the dataset API to unify schemas safely. Streams batches to avoid OOM.
+    If reference_schema is provided, the final file is projected to match it *exactly*.
+    Otherwise, uses the dataset API to unify schemas safely.
+    Streams batches to avoid OOM.
     Returns total rows written.
     """
     dataset = ds.dataset(shards, format="parquet")
     unified_schema = dataset.schema
+    target_schema = reference_schema if reference_schema is not None else unified_schema
 
     out_parquet.parent.mkdir(parents=True, exist_ok=True)
     total_rows = 0
 
     with pq.ParquetWriter(
         where=str(out_parquet),
-        schema=unified_schema,
+        schema=target_schema,
         compression=compression,
         use_dictionary=True,
         write_statistics=True,
@@ -334,7 +441,19 @@ def _coalesce_shards_to_single(
             unit="batch",
             dynamic_ncols=True,
         ):
-            tbl = pa.Table.from_batches([batch], schema=unified_schema)
+            # Build a table from this batch with its native schema
+            tbl = pa.Table.from_batches([batch])
+            # Align to the target schema if requested
+            if reference_schema is not None:
+                tbl = _align_table_to_schema(tbl, target_schema)
+            else:
+                # cheap rewrap to the unified schema for consistency
+                if not tbl.schema.equals(target_schema):
+                    # Rebuild to ensure consistent field ordering if needed
+                    cols = [tbl[name] if name in tbl.column_names else pa.nulls(tbl.num_rows, type=f.type)
+                            for f, name in zip(target_schema, target_schema.names)]
+                    tbl = pa.Table.from_arrays(cols, schema=target_schema)
+
             total_rows += tbl.num_rows
             writer.write_table(tbl)
 
@@ -425,6 +544,7 @@ def build_subreddit_parquet(
     progress_heartbeat_lines: int = 200_000,
     coalesce_batch_rows: int = 64_000,
     log_file: Optional[Path] = None,
+    schema_from: Optional[Path] = None,  # <-- enforce final schema identical to an existing Parquet
 ) -> None:
     # Prepare log
     if log_file is None:
@@ -451,6 +571,18 @@ def build_subreddit_parquet(
         tmp_dir = out_parquet.parent / f"{out_parquet.stem}_shards"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    # Optional reference schema
+    reference_schema: Optional[pa.Schema] = None
+    if schema_from is not None:
+        try:
+            reference_schema = _read_schema_from_parquet(schema_from)
+            LOG({"event": "reference_schema_loaded", "schema_from": str(schema_from),
+                 "fields": reference_schema.names, "num_fields": len(reference_schema)})
+        except Exception as e:
+            LOG({"event": "reference_schema_error", "schema_from": str(schema_from),
+                 "error": f"{e.__class__.__name__}: {e}"})
+            raise
+
     # Run configuration log
     LOG({
         "event": "config",
@@ -469,6 +601,7 @@ def build_subreddit_parquet(
         "heartbeat_lines": progress_heartbeat_lines,
         "coalesce_batch_rows": coalesce_batch_rows,
         "log_file": str(log_file),
+        "schema_from": str(schema_from) if schema_from else None,
     })
 
     print(f"Discovered {len(files)} files; spawning {workers} workers; tmp_dir={tmp_dir}; recursive={recursive}")
@@ -540,7 +673,8 @@ def build_subreddit_parquet(
 
     LOG({"event": "coalesce_start", "shard_count": len(shard_paths), "out": str(out_parquet)})
     rows_written = _coalesce_shards_to_single(
-        shard_paths, out_parquet, compression=compression, coalesce_batch_rows=coalesce_batch_rows
+        shard_paths, out_parquet, compression=compression, coalesce_batch_rows=coalesce_batch_rows,
+        reference_schema=reference_schema
     )
     LOG({"event": "coalesce_done", "rows_written": rows_written, "out_size_bytes": out_parquet.stat().st_size})
 
@@ -639,6 +773,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to JSON-lines log file (default: <out_parquet_dir>/build_subreddit_parquet.log)",
     )
+    p.add_argument(
+        "--schema_from",
+        type=Path,
+        default=None,
+        help="Path to an existing Parquet file or directory whose schema to enforce for the FINAL output.",
+    )
     return p.parse_args()
 
 
@@ -658,6 +798,7 @@ def main() -> None:
         progress_heartbeat_lines=args.progress_heartbeat_lines,
         coalesce_batch_rows=args.coalesce_batch_rows,
         log_file=args.log_file,
+        schema_from=args.schema_from,
     )
 
 
